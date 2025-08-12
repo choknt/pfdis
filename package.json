@@ -1,0 +1,11 @@
+{
+  "name": "discord-playfab-verify-bot",
+  "type": "module",
+  "scripts": { "start": "node src/index.js" },
+  "dependencies": {
+    "discord.js": "14.15.3",
+    "dotenv": "16.4.5",
+    "mongoose": "8.6.2",
+    "playfab-sdk": "2.130.240926"
+  }
+}
