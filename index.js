@@ -1,273 +1,135 @@
-import { Client, GatewayIntentBits, Partials, SlashCommandBuilder, Routes, REST, ActionRowBuilder, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle, EmbedBuilder, InteractionType } from 'discord.js';
-import mongoose from 'mongoose';
-import dotenv from 'dotenv';
-import express from 'express';
-import PlayFab from 'playfab-sdk';
+ import 'dotenv/config'; import express from 'express'; import mongoose from 'mongoose'; import PlayFab from 'playfab-sdk'; import { ActionRowBuilder, ButtonBuilder, ButtonStyle, Client, EmbedBuilder, Events, GatewayIntentBits, InteractionType, ModalBuilder, Partials, REST, Routes, SlashCommandBuilder, TextInputBuilder, TextInputStyle, ChannelType } from 'discord.js';
 
-dotenv.config();
+// ===== ENV ===== const { DISCORD_TOKEN, DISCORD_CLIENT_ID, DISCORD_GUILD_ID, MONGO_URI, PLAYFAB_TITLE_ID, LOG_CHANNEL_ID, ADMIN_ROLE_ID, FORM_IMAGE_URL } = process.env;
 
-// ---------- CONFIG ----------
-const {
-  DISCORD_TOKEN,
-  DISCORD_CLIENT_ID,
-  DISCORD_GUILD_ID,
-  MONGO_URI,
-  PLAYFAB_TITLE_ID,
-  LOG_CHANNEL_ID,
-  ADMIN_ROLE_ID,
-  FORM_IMAGE_URL
-} = process.env;
+if (!DISCORD_TOKEN || !DISCORD_CLIENT_ID || !MONGO_URI || !PLAYFAB_TITLE_ID) { console.error('❌ Missing required env vars. Please check .env'); process.exit(1); }
 
-// ---------- MONGODB ----------
-const playerSchema = new mongoose.Schema({
-  discordId: String,
-  discordName: String,
-  gameId: String,
-  gameName: String
-});
-const Player = mongoose.model('Player', playerSchema);
+// ===== Mongo ===== const verifySchema = new mongoose.Schema( { discordId: { type: String, index: true, unique: true }, discordName: { type: String, index: true }, playFabId: { type: String, index: true }, playerName: String }, { timestamps: true } ); const Verify = mongoose.model('Verify', verifySchema);
 
-// ---------- DISCORD CLIENT ----------
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages],
-  partials: [Partials.Channel]
-});
+// ===== PlayFab (Client API in Node) ===== PlayFab.settings.titleId = PLAYFAB_TITLE_ID; let playfabReady = false; function ensurePlayFabLogin() { if (playfabReady) return Promise.resolve(true); return new Promise((resolve) => { const CustomId = 'bot-' + Math.random().toString(36).slice(2); PlayFab.PlayFabClient.LoginWithCustomID({ TitleId: PLAYFAB_TITLE_ID, CustomId, CreateAccount: true }, (err) => { if (err) { console.error('❌ PlayFab login failed:', err); return resolve(false); } playfabReady = true; resolve(true); }); }); }
 
-// ---------- PLAYFAB ----------
-PlayFab.settings.titleId = PLAYFAB_TITLE_ID;
+async function getAccountInfoByPlayFabId(playFabId) { const ok = await ensurePlayFabLogin(); if (!ok) return { found: false, error: 'PlayFab session not ready' }; return new Promise((resolve) => { PlayFab.PlayFabClient.GetAccountInfo({ PlayFabId: playFabId }, (err, res) => { if (err) return resolve({ found: false, error: err?.errorMessage || 'GetAccountInfo failed' }); const a = res?.data?.AccountInfo || {}; const displayName = a?.TitleInfo?.DisplayName || null; const username = a?.Username || null; const created = a?.TitleInfo?.Created || null; resolve({ found: true, displayName, username, created }); }); }); }
 
-// helper: get gameName from PlayFabId
-async function getGameNameById(playfabId) {
-  return new Promise((resolve) => {
-    PlayFab.Client.GetAccountInfo({ PlayFabId: playfabId }, (result, error) => {
-      if (result && result.data && result.data.AccountInfo && result.data.AccountInfo.TitleInfo) {
-        resolve(result.data.AccountInfo.TitleInfo.DisplayName || null);
-      } else {
-        resolve(null);
-      }
-    });
-  });
+// ===== Discord Client ===== const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages], partials: [Partials.Channel] });
+
+// ===== Helpers ===== const isDM = (interaction) => !interaction.guild; const requireAdmin = (interaction) => interaction.guild && ADMIN_ROLE_ID && interaction.member?.roles?.cache?.has(ADMIN_ROLE_ID); const fmt = (dt) => { if (!dt) return '—'; const d = new Date(dt); return isNaN(d) ? String(dt) : d.toLocaleString(); };
+
+// ===== Slash Commands (DM enabled for user cmds) ===== const commands = [ new SlashCommandBuilder().setName('send-form').setDescription('ส่งข้อความยืนยันตัวตน (มีปุ่ม+โมดอล)').setDMPermission(true), new SlashCommandBuilder().setName('show').setDescription('แสดงข้อมูลยืนยันของตัวเอง').setDMPermission(true), new SlashCommandBuilder().setName('edit').setDescription('แก้ไขไอดีเกมของตัวเอง').setDMPermission(true), new SlashCommandBuilder() .setName('py-info') .setDescription('แสดงข้อมูลผู้เล่นจาก PlayFabId (เฉพาะแอดมินในกิลด์)') .addStringOption(o => o.setName('id').setDescription('PlayFabId').setRequired(true)) .setDMPermission(false), new SlashCommandBuilder() .setName('admin-show') .setDescription('แสดงข้อมูลที่ผู้ใช้ส่งมายืนยัน (เฉพาะแอดมิน)') .addStringOption(o => o.setName('discord_name').setDescription('ชื่อ Discord (เช่น user#1234)').setRequired(true)) .setDMPermission(false), new SlashCommandBuilder() .setName('admin-edit') .setDescription('แก้ไขข้อมูลยืนยันของผู้ใช้ (เฉพาะแอดมิน)') .addStringOption(o => o.setName('discord_name').setDescription('ชื่อ Discord (เช่น user#1234)').setRequired(true)) .setDMPermission(false) ].map(c => c.toJSON());
+
+async function registerCommands() { const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN); // Guild (ขึ้นไว) if (DISCORD_GUILD_ID) { await rest.put(Routes.applicationGuildCommands(DISCORD_CLIENT_ID, DISCORD_GUILD_ID), { body: commands }); console.log('✅ Guild commands registered'); } // Global (ใช้ใน DM) await rest.put(Routes.applicationCommands(DISCORD_CLIENT_ID), { body: commands }); console.log('✅ Global commands registered'); }
+
+// ===== UI Builders ===== function buildFormEmbed() { const e = new EmbedBuilder() .setTitle('โปรดยืนยันว่าคุณเป็นผู้เล่น') .setDescription('กดปุ่ม ไอดีของคุณ เพื่อกรอก PlayFabId ตัวอย่าง: 25CDF5286DC38DAD') .setColor(0x5865F2); if (FORM_IMAGE_URL) e.setImage(FORM_IMAGE_URL); return e; } function buildVerifyButtonRow() { return new ActionRowBuilder().addComponents( new ButtonBuilder().setCustomId('open_verify_modal').setLabel('ไอดีของคุณ').setStyle(ButtonStyle.Primary) ); } function buildVerifyModal(customId = 'verify_modal', title = 'ยืนยันผู้เล่น (PlayFab)') { const modal = new ModalBuilder().setCustomId(customId).setTitle(title); const input = new TextInputBuilder() .setCustomId('playfab_id') .setLabel('โปรดป้อน PlayFabId ของคุณ (เช่น 25CDF5286DC38DAD)') .setPlaceholder('เช่น 25CDF5286DC38DAD') .setStyle(TextInputStyle.Short) .setRequired(true) .setMaxLength(32); modal.addComponents(new ActionRowBuilder().addComponents(input)); return modal; } function buildUserEmbed({ discordId, discordName, playFabId, playerName }) { return new EmbedBuilder() .setTitle('ยืนยันผ่าน') .setColor(0x2ecc71) .addFields( { name: 'ไอดีเกม', value: playFabId, inline: false }, { name: 'ชื่อผู้เล่น', value: playerName || '—', inline: false }, { name: 'ไอดี Discord', value: discordId, inline: true }, { name: 'ชื่อ Discord', value: discordName || '—', inline: true } ) .setTimestamp(); } function buildFailEmbed(playFabId) { return new EmbedBuilder() .setTitle('ไม่ผ่านการยืนยัน') .setDescription(เราไม่พบ **${playFabId}** ในระบบ โปรดตรวจสอบและลองใหม่อีกครั้ง) .setColor(0xe74c3c) .setTimestamp(); }
+
+// ===== Discord Events ===== client.once(Events.ClientReady, async () => { console.log(🤖 Logged in as ${client.user.tag}); await registerCommands(); });
+
+client.on(Events.InteractionCreate, async (interaction) => { try { if (interaction.isChatInputCommand()) { const { commandName } = interaction;
+
+if (commandName === 'send-form') {
+    return interaction.reply({ embeds: [buildFormEmbed()], components: [buildVerifyButtonRow()], ephemeral: isDM(interaction) });
+  }
+
+  if (commandName === 'show') {
+    const doc = await Verify.findOne({ discordId: interaction.user.id });
+    if (!doc) return interaction.reply({ content: 'ยังไม่มีข้อมูลยืนยันของคุณ', ephemeral: true });
+    return interaction.reply({ embeds: [buildUserEmbed(doc)], ephemeral: true });
+  }
+
+  if (commandName === 'edit') {
+    return interaction.showModal(buildVerifyModal('verify_modal', 'แก้ไข/ยืนยันไอดีเกมของคุณ'));
+  }
+
+  if (commandName === 'py-info') {
+    if (!requireAdmin(interaction)) return interaction.reply({ content: 'ต้องมีบทบาทแอดมิน', ephemeral: true });
+    const pid = interaction.options.getString('id', true);
+    await interaction.deferReply({ ephemeral: true });
+    const info = await getAccountInfoByPlayFabId(pid);
+    if (!info.found) return interaction.editReply('ไม่พบผู้เล่นหรือเกิดข้อผิดพลาด: ' + (info.error || ''));
+    const embed = new EmbedBuilder()
+      .setTitle('ข้อมูลผู้เล่น (py-info)')
+      .setColor(0x00a8ff)
+      .addFields(
+        { name: 'ไอดี', value: pid, inline: false },
+        { name: 'ชื่อผู้เล่น', value: info.displayName || info.username || '—', inline: true },
+        { name: 'วันสร้าง', value: fmt(info.created), inline: true }
+      ).setTimestamp();
+    return interaction.editReply({ embeds: [embed] });
+  }
+
+  if (commandName === 'admin-show') {
+    if (!requireAdmin(interaction)) return interaction.reply({ content: 'ต้องมีบทบาทแอดมิน', ephemeral: true });
+    const name = interaction.options.getString('discord_name', true);
+    const doc = await Verify.findOne({ discordName: name });
+    if (!doc) return interaction.reply({ content: 'ไม่พบข้อมูลของผู้ใช้ชื่อนี้', ephemeral: true });
+    return interaction.reply({ embeds: [buildUserEmbed(doc)], ephemeral: true });
+  }
+
+  if (commandName === 'admin-edit') {
+    if (!requireAdmin(interaction)) return interaction.reply({ content: 'ต้องมีบทบาทแอดมิน', ephemeral: true });
+    const name = interaction.options.getString('discord_name', true);
+    const doc = await Verify.findOne({ discordName: name });
+    if (!doc) return interaction.reply({ content: 'ไม่พบข้อมูลของผู้ใช้ชื่อนี้', ephemeral: true });
+    const modal = buildVerifyModal(`admin_edit_modal:${doc.discordId}`, `แก้ไขไอดีเกมของ ${name}`);
+    return interaction.showModal(modal);
+  }
+
+  return;
 }
 
-// ---------- COMMANDS ----------
-const commands = [
-  new SlashCommandBuilder()
-    .setName('send-form')
-    .setDescription('ส่งฟอร์มยืนยันตัวตน'),
-  new SlashCommandBuilder()
-    .setName('show')
-    .setDescription('แสดงข้อมูลการยืนยันของตัวเอง'),
-  new SlashCommandBuilder()
-    .setName('edit')
-    .setDescription('แก้ไขไอดีเกมของตัวเอง'),
-  new SlashCommandBuilder()
-    .setName('py-info')
-    .setDescription('ดูข้อมูลผู้เล่นจาก PlayFab ID (admin)')
-    .addStringOption(opt => opt.setName('id').setDescription('PlayFabId').setRequired(true)),
-  new SlashCommandBuilder()
-    .setName('admin-show')
-    .setDescription('ดูข้อมูลของผู้ใช้ที่ยืนยันแล้ว (admin)')
-    .addStringOption(opt => opt.setName('discord_name').setDescription('ชื่อ Discord').setRequired(true)),
-  new SlashCommandBuilder()
-    .setName('admin-edit')
-    .setDescription('แก้ไขไอดีเกมของผู้ใช้ (admin)')
-    .addStringOption(opt => opt.setName('discord_name').setDescription('ชื่อ Discord').setRequired(true))
-].map(cmd => cmd.toJSON());
-
-// ---------- REGISTER COMMANDS ----------
-const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
-(async () => {
-  try {
-    console.log('Registering slash commands...');
-    await rest.put(Routes.applicationGuildCommands(DISCORD_CLIENT_ID, DISCORD_GUILD_ID), { body: commands });
-    console.log('Commands registered.');
-  } catch (err) {
-    console.error(err);
+if (interaction.isButton()) {
+  if (interaction.customId === 'open_verify_modal') {
+    return interaction.showModal(buildVerifyModal());
   }
-})();
+  return;
+}
 
-// ---------- EVENT HANDLERS ----------
-client.on('ready', async () => {
-  console.log(`🤖 Logged in as ${client.user.tag}`);
-  await mongoose.connect(MONGO_URI);
-  console.log('✅ Mongo connected');
-});
+if (interaction.type === InteractionType.ModalSubmit) {
+  const pfId = interaction.fields.getTextInputValue('playfab_id').trim();
 
-client.on('interactionCreate', async (interaction) => {
-  if (interaction.isChatInputCommand()) {
-    const { commandName } = interaction;
-
-    if (commandName === 'send-form') {
-      const embed = new EmbedBuilder()
-        .setTitle('โปรดยืนยันว่าคุณเป็นผู้เล่น')
-        .setDescription('โปรดกดปุ่มด้านล่างเพื่อกรอก ID ผู้เล่นของคุณ')
-        .setImage(FORM_IMAGE_URL || null)
-        .setColor(0x00AE86);
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId('verify_button')
-          .setLabel('ไอดีของคุณ')
-          .setStyle(ButtonStyle.Primary)
-      );
-      await interaction.reply({ embeds: [embed], components: [row] });
-    }
-
-    if (commandName === 'show') {
-      const data = await Player.findOne({ discordId: interaction.user.id });
-      if (!data) return interaction.reply({ content: 'คุณยังไม่ได้ยืนยันตัวตน', ephemeral: true });
-      const embed = new EmbedBuilder()
-        .setTitle('ข้อมูลการยืนยันของคุณ')
-        .addFields(
-          { name: 'ไอดีเกม', value: data.gameId },
-          { name: 'ชื่อผู้เล่น', value: data.gameName },
-          { name: 'ไอดี Discord', value: data.discordId },
-          { name: 'ชื่อ Discord', value: data.discordName }
-        )
-        .setColor(0x00AE86);
-      await interaction.reply({ embeds: [embed], ephemeral: true });
-    }
-
-    if (commandName === 'edit') {
-      const modal = new ModalBuilder()
-        .setCustomId('edit_modal')
-        .setTitle('แก้ไขไอดีเกมของคุณ');
-      const input = new TextInputBuilder()
-        .setCustomId('edit_gameid')
-        .setLabel('ไอดีเกมใหม่')
-        .setPlaceholder('เช่น 25CDF5286DC38DAD')
-        .setStyle(TextInputStyle.Short)
-        .setRequired(true);
-      modal.addComponents(new ActionRowBuilder().addComponents(input));
-      await interaction.showModal(modal);
-    }
-
-    if (commandName === 'py-info') {
-      if (!interaction.member.roles.cache.has(ADMIN_ROLE_ID)) return interaction.reply({ content: 'ไม่มีสิทธิ์', ephemeral: true });
-      const id = interaction.options.getString('id');
-      const name = await getGameNameById(id);
-      await interaction.reply({ content: name ? `ชื่อผู้เล่น: ${name}` : 'ไม่พบข้อมูล' });
-    }
-
-    if (commandName === 'admin-show') {
-      if (!interaction.member.roles.cache.has(ADMIN_ROLE_ID)) return interaction.reply({ content: 'ไม่มีสิทธิ์', ephemeral: true });
-      const discordName = interaction.options.getString('discord_name');
-      const data = await Player.findOne({ discordName });
-      if (!data) return interaction.reply({ content: 'ไม่พบข้อมูล', ephemeral: true });
-      const embed = new EmbedBuilder()
-        .setTitle(`ข้อมูลของ ${discordName}`)
-        .addFields(
-          { name: 'ไอดีเกม', value: data.gameId },
-          { name: 'ชื่อผู้เล่น', value: data.gameName },
-          { name: 'ไอดี Discord', value: data.discordId },
-          { name: 'ชื่อ Discord', value: data.discordName }
-        )
-        .setColor(0x00AE86);
-      await interaction.reply({ embeds: [embed], ephemeral: true });
-    }
-
-    if (commandName === 'admin-edit') {
-      if (!interaction.member.roles.cache.has(ADMIN_ROLE_ID)) return interaction.reply({ content: 'ไม่มีสิทธิ์', ephemeral: true });
-      const discordName = interaction.options.getString('discord_name');
-      const modal = new ModalBuilder()
-        .setCustomId(`admin_edit_modal_${discordName}`)
-        .setTitle(`แก้ไขไอดีเกมของ ${discordName}`);
-      const input = new TextInputBuilder()
-        .setCustomId('admin_edit_gameid')
-        .setLabel('ไอดีเกมใหม่')
-        .setStyle(TextInputStyle.Short)
-        .setRequired(true);
-      modal.addComponents(new ActionRowBuilder().addComponents(input));
-      await interaction.showModal(modal);
-    }
+  // admin edit
+  if (interaction.customId.startsWith('admin_edit_modal:')) {
+    if (!requireAdmin(interaction)) return interaction.reply({ content: 'ต้องมีบทบาทแอดมิน', ephemeral: true });
+    const targetDiscordId = interaction.customId.split(':')[1];
+    await interaction.deferReply({ ephemeral: true });
+    const info = await getAccountInfoByPlayFabId(pfId);
+    if (!info.found) return interaction.editReply({ embeds: [buildFailEmbed(pfId)] });
+    const playerName = info.displayName || info.username || null;
+    const doc = await Verify.findOneAndUpdate(
+      { discordId: targetDiscordId },
+      { playFabId: pfId, playerName },
+      { new: true }
+    );
+    return interaction.editReply({ content: 'แก้ไขข้อมูลสำเร็จ', embeds: [buildUserEmbed(doc)] });
   }
 
-  // ---------- BUTTON ----------
-  if (interaction.isButton()) {
-    if (interaction.customId === 'verify_button') {
-      const modal = new ModalBuilder()
-        .setCustomId('verify_modal')
-        .setTitle('โปรดป้อนไอดีเกมของคุณ');
-      const input = new TextInputBuilder()
-        .setCustomId('verify_gameid')
-        .setLabel('ไอดีเกม')
-        .setPlaceholder('เช่น 25CDF5286DC38DAD')
-        .setStyle(TextInputStyle.Short)
-        .setRequired(true);
-      modal.addComponents(new ActionRowBuilder().addComponents(input));
-      await interaction.showModal(modal);
+  // self verify/edit
+  if (interaction.customId === 'verify_modal') {
+    await interaction.deferReply({ ephemeral: true });
+    const info = await getAccountInfoByPlayFabId(pfId);
+    if (!info.found) {
+      try { await interaction.user.send({ embeds: [buildFailEmbed(pfId)] }); } catch {}
+      return interaction.editReply({ embeds: [buildFailEmbed(pfId)] });
     }
-  }
+    const playerName = info.displayName || info.username || null;
+    const payload = { discordId: interaction.user.id, discordName: interaction.user.tag, playFabId: pfId, playerName };
+    const doc = await Verify.findOneAndUpdate({ discordId: interaction.user.id }, payload, { upsert: true, new: true, setDefaultsOnInsert: true });
 
-  // ---------- MODALS ----------
-  if (interaction.type === InteractionType.ModalSubmit) {
-    if (interaction.customId === 'verify_modal') {
-      const gameId = interaction.fields.getTextInputValue('verify_gameid');
-      const name = await getGameNameById(gameId);
-      if (!name) {
-        await interaction.user.send({ content: `ไม่พบ ${gameId} ในระบบ โปรดลองอีกครั้ง` });
-        return interaction.reply({ content: 'ไม่พบข้อมูล', ephemeral: true });
+    const successEmbed = buildUserEmbed(doc);
+    try { await interaction.user.send({ embeds: [successEmbed] }); } catch {}
+
+    try {
+      if (LOG_CHANNEL_ID) {
+        const ch = await client.channels.fetch(LOG_CHANNEL_ID);
+        if (ch?.type === ChannelType.GuildText) await ch.send({ embeds: [successEmbed] });
       }
-      const data = await Player.findOneAndUpdate(
-        { discordId: interaction.user.id },
-        { discordId: interaction.user.id, discordName: interaction.user.username, gameId, gameName: name },
-        { upsert: true, new: true }
-      );
-      const logChannel = await client.channels.fetch(LOG_CHANNEL_ID);
-      if (logChannel) {
-        const embed = new EmbedBuilder()
-          .setTitle('ผู้ใช้ยืนยันตัวตนแล้ว')
-          .addFields(
-            { name: 'ไอดี Discord', value: data.discordId },
-            { name: 'ชื่อ Discord', value: data.discordName },
-            { name: 'ไอดีเกม', value: data.gameId },
-            { name: 'ชื่อผู้เล่น', value: data.gameName }
-          );
-        logChannel.send({ embeds: [embed] });
-      }
-      await interaction.user.send({
-        embeds: [
-          new EmbedBuilder()
-            .setTitle('ยืนยันผ่าน')
-            .addFields(
-              { name: 'ไอดีเกม', value: gameId },
-              { name: 'ชื่อผู้เล่น', value: name },
-              { name: 'ไอดี Discord', value: interaction.user.id },
-              { name: 'ชื่อ Discord', value: interaction.user.username }
-            )
-        ]
-      });
-      await interaction.reply({ content: 'ยืนยันสำเร็จ', ephemeral: true });
-    }
+    } catch (e) { console.warn('log channel error', e?.message); }
 
-    if (interaction.customId === 'edit_modal') {
-      const gameId = interaction.fields.getTextInputValue('edit_gameid');
-      const name = await getGameNameById(gameId);
-      if (!name) return interaction.reply({ content: 'ไม่พบข้อมูล', ephemeral: true });
-      await Player.findOneAndUpdate(
-        { discordId: interaction.user.id },
-        { gameId, gameName: name }
-      );
-      await interaction.reply({ content: 'แก้ไขข้อมูลสำเร็จ', ephemeral: true });
-    }
-
-    if (interaction.customId.startsWith('admin_edit_modal_')) {
-      const discordName = interaction.customId.replace('admin_edit_modal_', '');
-      const gameId = interaction.fields.getTextInputValue('admin_edit_gameid');
-      const name = await getGameNameById(gameId);
-      if (!name) return interaction.reply({ content: 'ไม่พบข้อมูล', ephemeral: true });
-      await Player.findOneAndUpdate(
-        { discordName },
-        { gameId, gameName: name }
-      );
-      await interaction.reply({ content: 'แก้ไขข้อมูลสำเร็จ', ephemeral: true });
-    }
+    return interaction.editReply({ content: 'บันทึกข้อมูลและยืนยันสำเร็จ ✅', embeds: [successEmbed] });
   }
-});
+}
 
-// ---------- EXPRESS HEALTH SERVER ----------
-const app = express();
-app.get('/health', (_req, res) => res.status(200).send('OK'));
-app.listen(process.env.PORT || 3000, () => console.log('HTTP health server running'));
+} catch (e) { console.error('Interaction error:', e); if (interaction.isRepliable()) { try { await interaction.reply({ content: 'เกิดข้อผิดพลาดภายในระบบ', ephemeral: true }); } catch {} } } });
 
-// ---------- LOGIN ----------
-client.login(DISCORD_TOKEN);
+// ===== HTTP Health Server (/health) ===== const app = express(); app.get('/', (_req, res) => res.status(200).send('OK')); app.get('/health', (_req, res) => res.status(200).json({ status: 'ok', time: new Date().toISOString() })); const PORT = process.env.PORT || 3000; app.listen(PORT, () => console.log('HTTP health server on', PORT));
+
+// ===== Bootstrap ===== (async () => { try { await mongoose.connect(MONGO_URI); console.log('✅ Mongo connected'); const ok = await ensurePlayFabLogin(); if (!ok) throw new Error('PlayFab login failed'); console.log('✅ PlayFab session ready'); await client.login(DISCORD_TOKEN); } catch (e) { console.error('Startup error:', e); process.exit(1); } })();
+
