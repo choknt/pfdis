@@ -1,3 +1,4 @@
+// index.js — Discord Bot + PlayFab Verify + Mongo + Express /health
 import 'dotenv/config';
 import express from 'express';
 import mongoose from 'mongoose';
@@ -21,35 +22,37 @@ import {
   TextInputStyle
 } from 'discord.js';
 
-// ===== ENV =====
+/* ========= ENV ========= */
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const MONGO_URI = process.env.MONGO_URI;
 const TITLE_ID = process.env.PLAYFAB_TITLE_ID;
-const PRIMARY_GUILD_ID = process.env.PRIMARY_GUILD_ID;
-const ADMIN_ROLE_ID_A = process.env.ADMIN_ROLE_ID_A;
-const LOG_CHANNEL_ID_A = process.env.LOG_CHANNEL_ID_A;
-const FORM_IMAGE_URL = process.env.FORM_IMAGE_URL;
+const PRIMARY_GUILD_ID = process.env.PRIMARY_GUILD_ID;      // Server A
+const ADMIN_ROLE_ID_A  = process.env.ADMIN_ROLE_ID_A;       // Admin role in Server A
+// ใช้ห้อง log ตามโจทย์ 1404414214839341056 โดย default ถ้าไม่ใส่ ENV
+const LOG_CHANNEL_ID_A = process.env.LOG_CHANNEL_ID_A || '1404414214839341056';
+
+const FORM_IMAGE_URL = process.env.FORM_IMAGE_URL;          // optional
 const PORT = process.env.PORT || 3000;
 
 for (const [k, v] of Object.entries({
-  TOKEN, CLIENT_ID, MONGO_URI, TITLE_ID, PRIMARY_GUILD_ID, ADMIN_ROLE_ID_A, LOG_CHANNEL_ID_A
+  TOKEN, CLIENT_ID, MONGO_URI, TITLE_ID, PRIMARY_GUILD_ID, ADMIN_ROLE_ID_A
 })) {
   if (!v) { console.error('❌ Missing env:', k); process.exit(1); }
 }
 
-// ===== Mongo Model =====
+/* ========= Mongo Model ========= */
 const Verify = mongoose.model(
   'Verify',
   new mongoose.Schema({
-    discordId: { type: String, index: true, unique: true },
+    discordId:   { type: String, index: true, unique: true },
     discordName: { type: String, index: true },
-    playFabId: { type: String, index: true },
-    playerName: String
+    playFabId:   { type: String, index: true },
+    playerName:  String
   }, { timestamps: true })
 );
 
-// ===== PlayFab (Client API) =====
+/* ========= PlayFab (Client API) ========= */
 PlayFab.settings.titleId = TITLE_ID;
 let playfabReady = false;
 function ensurePlayFabLogin() {
@@ -81,7 +84,7 @@ async function getAccountInfoByPlayFabId(playFabId) {
   });
 }
 
-// ===== Discord Client =====
+/* ========= Discord Client ========= */
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -91,7 +94,7 @@ const client = new Client({
   partials: [Partials.Channel]
 });
 
-// ===== Server A helpers =====
+/* ========= Helpers (Server A) ========= */
 async function isAdminInPrimaryGuild(userId) {
   try {
     const guildA = await client.guilds.fetch(PRIMARY_GUILD_ID);
@@ -111,11 +114,11 @@ async function logToPrimaryGuild(embed) {
   }
 }
 
-// ===== UI builders =====
-const DEFAULT_FORM_IMAGE = 'https://i.imgur.com/7W0r3aY.png'; // รูปสำรอง (สาธารณะ)
+/* ========= UI builders ========= */
+const DEFAULT_FORM_IMAGE = 'https://i.imgur.com/7W0r3aY.png'; // สำรอง
 function buildFormEmbed() {
   const e = new EmbedBuilder()
-    .setTitle('โปรดยืนยันว่าคุณเป็นผู้เล่น')
+    .setTitle('โปรดยืนยันว่าคุณเป็นผู้เล่น โดยการป้อน ID ผู้เล่นของคุณ')
     .setDescription('กดปุ่ม **ไอดีของคุณ** เพื่อกรอก **PlayFabId**\\nตัวอย่าง: `25CDF5286DC38DAD`')
     .setColor(0x5865f2);
   e.setImage(FORM_IMAGE_URL || DEFAULT_FORM_IMAGE);
@@ -126,11 +129,11 @@ function buildVerifyButtonRow() {
     new ButtonBuilder().setCustomId('open_verify_modal').setLabel('ไอดีของคุณ').setStyle(ButtonStyle.Primary)
   );
 }
-function buildVerifyModal(customId = 'verify_modal', title = 'ยืนยันผู้เล่น (PlayFab)') {
-  const modal = new ModalBuilder().setCustomId(customId).setTitle(title);
+function buildVerifyModal() {
+  const modal = new ModalBuilder().setCustomId('verify_modal').setTitle('โปรดป้อนไอดีของคุณ');
   const input = new TextInputBuilder()
     .setCustomId('playfab_id')
-    .setLabel('โปรดป้อน PlayFabId ของคุณ (เช่น 25CDF5286DC38DAD)')
+    .setLabel('ตัวอย่าง: 25CDF5286DC38DAD')
     .setPlaceholder('เช่น 25CDF5286DC38DAD')
     .setStyle(TextInputStyle.Short)
     .setRequired(true)
@@ -138,28 +141,30 @@ function buildVerifyModal(customId = 'verify_modal', title = 'ยืนยัน
   modal.addComponents(new ActionRowBuilder().addComponents(input));
   return modal;
 }
-function buildUserEmbed({ discordId, discordName, playFabId, playerName }) {
+function buildSuccessEmbed({ discordId, discordName, playFabId, playerName }) {
   return new EmbedBuilder()
-    .setTitle('ยืนยันผ่าน')
-    .setColor(0x2ecc71)
+    .setTitle('ยืนยันผ่าน:')
+    .setDescription('ตอนนี้คุณผ่านการยืนยัน')
     .addFields(
-      { name: 'ไอดีเกม', value: playFabId || '—', inline: false },
+      { name: 'ไอดีเกม', value: playFabId, inline: false },
       { name: 'ชื่อผู้เล่น', value: playerName || '—', inline: false },
       { name: 'ไอดี Discord', value: discordId, inline: true },
       { name: 'ชื่อ Discord', value: discordName || '—', inline: true }
     )
+    .setColor(0x2ecc71)
     .setTimestamp();
 }
 function buildFailEmbed(playFabId) {
   return new EmbedBuilder()
-    .setTitle('ไม่ผ่านการยืนยัน')
-    .setDescription(`เราไม่พบ **${playFabId}** ในระบบ โปรดตรวจสอบและลองใหม่อีกครั้ง`)
+    .setTitle('ไม่ผ่านการยืนยัน:')
+    .setDescription(`เราขอแสดงความเสียใจ เราไม่พบ **${playFabId}** ในระบบที่คุณส่งมา โปรดลองอีกครั้ง และโปรดตรวจสอบไอดีเกมให้ถูกต้อง`)
+    .setImage(FORM_IMAGE_URL || DEFAULT_FORM_IMAGE)
     .setColor(0xe74c3c)
     .setTimestamp();
 }
 
-// ===== Slash Commands =====
-// หมายเหตุ: /send-form เป็น "แอดมินเท่านั้น" (ตรวจใน handler) และให้ตอบ "ไม่ซ่อน" เพื่อให้ทุกคนเห็นฟอร์มในห้องนั้น
+/* ========= Slash Commands ========= */
+// /send-form = แอดมินเท่านั้น (ตรวจสิทธิ์ใน handler) และ “ไม่ซ่อน” เพื่อให้ฟอร์มอยู่ใช้ได้ตลอด
 const commands = [
   new SlashCommandBuilder().setName('send-form').setDescription('ส่งฟอร์มยืนยันผู้เล่น (แอดมินเท่านั้น)').setDMPermission(true),
   new SlashCommandBuilder().setName('show').setDescription('ดูข้อมูลของคุณ').setDMPermission(true),
@@ -169,7 +174,7 @@ const commands = [
     .addStringOption(o => o.setName('playerid').setDescription('ไอดีใหม่ (PlayFabId)').setRequired(true))
     .setDMPermission(true),
 
-  // แอดมิน (ใช้ได้ทุกที่ แต่ตรวจบทบาทใน Server A) — และ "ไม่ซ่อน" เวลา reply
+  // แอดมิน (ทุกที่ แต่ตรวจบทบาทใน Server A) — ไม่ซ่อนผลลัพธ์
   new SlashCommandBuilder()
     .setName('py-info')
     .setDescription('แสดงข้อมูลผู้เล่นจาก PlayFabId (ตรวจบทบาทใน Server A)')
@@ -194,7 +199,7 @@ async function registerCommands() {
   console.log('✅ Global commands registered');
 }
 
-// ===== Events =====
+/* ========= Events ========= */
 client.once(Events.ClientReady, async () => {
   console.log(`🤖 Logged in as ${client.user.tag}`);
   await registerCommands();
@@ -206,26 +211,33 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.isChatInputCommand()) {
       const { commandName } = interaction;
 
-      // --- send-form (แอดมินเท่านั้น) ---
+      // --- send-form (admin only) ---
       if (commandName === 'send-form') {
         const ok = await isAdminInPrimaryGuild(interaction.user.id);
         if (!ok) return interaction.reply({ content: '❌ คำสั่งนี้สำหรับแอดมินในเซิร์ฟเวอร์หลักเท่านั้น', ephemeral: true });
-        // แสดงฟอร์ม "ไม่ซ่อน" เพื่อให้ทุกคนเห็น/กดได้ในห้องนั้น
+        // ไม่ซ่อน เพื่อให้ฟอร์มอยู่ใช้ได้ตลอด
         return interaction.reply({ embeds: [buildFormEmbed()], components: [buildVerifyButtonRow()] });
       }
 
-      // --- show (ของผู้ใช้เอง) — ซ่อนข้อมูลส่วนตัวไว้ใน ephemeral ---
+      // --- show (ข้อมูลของตัวเอง) ---
       if (commandName === 'show') {
         const doc = await Verify.findOne({ discordId: interaction.user.id });
         if (!doc) return interaction.reply({ content: '❌ ยังไม่มีข้อมูลของคุณ', ephemeral: true });
-        return interaction.reply({ embeds: [buildUserEmbed(doc)], ephemeral: true });
+        const success = buildSuccessEmbed({
+          discordId: doc.discordId,
+          discordName: doc.discordName,
+          playFabId: doc.playFabId,
+          playerName: doc.playerName
+        });
+        return interaction.reply({ embeds: [success], ephemeral: true });
       }
 
-      // --- edit (ของผู้ใช้เอง) — ซ่อนผลตอบกลับ ---
+      // --- edit (ข้อมูลของตัวเอง) ---
       if (commandName === 'edit') {
         const pid = interaction.options.getString('playerid', true).trim();
         const info = await getAccountInfoByPlayFabId(pid);
         if (!info.found) return interaction.reply({ embeds: [buildFailEmbed(pid)], ephemeral: true });
+
         await Verify.findOneAndUpdate(
           { discordId: interaction.user.id },
           {
@@ -269,7 +281,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const doc = await Verify.findOne({ discordName: dname });
         if (!doc) return interaction.reply({ content: '❌ ไม่พบข้อมูลของผู้ใช้ชื่อนี้' });
 
-        return interaction.reply({ embeds: [buildUserEmbed(doc)] }); // ไม่ซ่อน
+        return interaction.reply({ embeds: [buildSuccessEmbed({
+          discordId: doc.discordId,
+          discordName: doc.discordName,
+          playFabId: doc.playFabId,
+          playerName: doc.playerName
+        })] }); // ไม่ซ่อน
       }
 
       // --- admin-edit (แอดมินทุกที่, ไม่ซ่อน) ---
@@ -291,12 +308,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         return interaction.reply({
           content: `✅ อัปเดต ${dname} เป็น ${updated.playerName || '—'}`,
-          embeds: [buildUserEmbed(updated)]
+          embeds: [buildSuccessEmbed({
+            discordId: updated.discordId,
+            discordName: updated.discordName,
+            playFabId: updated.playFabId,
+            playerName: updated.playerName
+          })]
         }); // ไม่ซ่อน
       }
     }
 
-    // ปุ่ม → เปิดโมดอล (หุ้ม try/catch กัน error)
+    // ปุ่ม → เปิดโมดอล (หุ้ม try/catch กัน error “ไม่สามารถเปิดฟอร์มได้”)
     if (interaction.isButton() && interaction.customId === 'open_verify_modal') {
       try {
         return await interaction.showModal(buildVerifyModal());
@@ -308,7 +330,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
     }
 
-    // โมดอล submit
+    // โมดอล submit → บันทึกลง Mongo + ส่ง Log + DM (embed)
     if (interaction.type === InteractionType.ModalSubmit && interaction.customId === 'verify_modal') {
       const pfId = interaction.fields.getTextInputValue('playfab_id').trim();
       await interaction.deferReply({ ephemeral: true });
@@ -331,10 +353,20 @@ client.on(Events.InteractionCreate, async (interaction) => {
         { upsert: true, new: true }
       );
 
-      const success = buildUserEmbed(doc);
+      const success = buildSuccessEmbed({
+        discordId: doc.discordId,
+        discordName: doc.discordName,
+        playFabId: doc.playFabId,
+        playerName: doc.playerName
+      });
+
+      // 1) DM ผู้ยืนยัน
       try { await interaction.user.send({ embeds: [success] }); } catch {}
+
+      // 2) ส่ง log ไปห้อง 1404414214839341056 (หรือ LOG_CHANNEL_ID_A)
       await logToPrimaryGuild(success);
 
+      // 3) ตอบกลับในที่เดิมแบบซ่อน (เพื่อความเป็นส่วนตัว)
       return interaction.editReply({ content: 'บันทึกข้อมูลและยืนยันสำเร็จ ✅', embeds: [success] });
     }
   } catch (e) {
@@ -345,13 +377,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 });
 
-// ===== Health server =====
+/* ========= Health server ========= */
 const app = express();
 app.get('/', (_req, res) => res.status(200).send('OK'));
 app.get('/health', (_req, res) => res.status(200).json({ status: 'ok', time: new Date().toISOString() }));
 app.listen(PORT, () => console.log('HTTP health server on', PORT));
 
-// ===== Bootstrap =====
+/* ========= Bootstrap ========= */
 (async () => {
   try {
     await mongoose.connect(MONGO_URI);
