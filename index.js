@@ -499,7 +499,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         discordId: doc.discordId,
         discordName: doc.discordName,
         playFabId: doc.playFabId,
-clanStatusText: isClan ? 'ยืนยันว่าเป็นคนในแคลน ✅' : 'ไม่พบในลิสต์แคลน'
+        clanStatusText: isClan ? 'ยืนยันว่าเป็นคนในแคลน ✅' : 'ไม่พบในลิสต์แคลน'
       });
 
       try { await interaction.user.send({ embeds: [userEmbed] }); } catch {}
@@ -512,7 +512,7 @@ clanStatusText: isClan ? 'ยืนยันว่าเป็นคนในแ
       try { await interaction.reply({ content: 'เกิดข้อผิดพลาดภายในระบบ', ephemeral: true }); } catch {}
     }
   }
-});
+}); // <== ปิด client.on(InteractionCreate)
 
 /* ========= Health server ========= */
 const app = express();
@@ -534,4 +534,3 @@ app.listen(PORT, () => console.log('HTTP health server on', PORT));
     process.exit(1);
   }
 })();
-```0
