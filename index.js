@@ -141,17 +141,31 @@ function buildVerifyModal() {
   modal.addComponents(new ActionRowBuilder().addComponents(input));
   return modal;
 }
-function buildSuccessEmbed({ discordId, discordName, playFabId, playerName }) {
+
+/* ========== Embeds (แยก “ผู้ใช้” กับ “log”) ========== */
+// สำหรับตอบผู้ใช้ในเซิร์ฟเวอร์/DM — ไม่แสดงชื่อผู้เล่น
+function buildUserConfirmEmbed({ discordId, discordName, playFabId }) {
   return new EmbedBuilder()
     .setTitle('ยืนยันผ่าน:')
     .setDescription('ตอนนี้คุณผ่านการยืนยัน')
     .addFields(
       { name: 'ไอดีเกม', value: playFabId, inline: false },
-      { name: 'ชื่อผู้เล่น', value: playerName || '—', inline: false },
       { name: 'ไอดี Discord', value: discordId, inline: true },
       { name: 'ชื่อ Discord', value: discordName || '—', inline: true }
     )
     .setColor(0x2ecc71)
+    .setTimestamp();
+}
+// สำหรับ log แอดมิน — แสดงชื่อผู้เล่นด้วย
+function buildLogEmbed({ discordId, discordName, playFabId, playerName }) {
+  return new EmbedBuilder()
+    .setTitle('LOG: ยืนยันผู้เล่นสำเร็จ')
+    .addFields(
+      { name: 'ไอดีเกม', value: playFabId, inline: true },
+      { name: 'ชื่อผู้เล่น', value: playerName || '—', inline: true },
+      { name: 'Discord', value: `${discordName || '—'} (${discordId})`, inline: false }
+    )
+    .setColor(0x3498db)
     .setTimestamp();
 }
 function buildFailEmbed(playFabId) {
@@ -219,26 +233,25 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return interaction.reply({ embeds: [buildFormEmbed()], components: [buildVerifyButtonRow()] });
       }
 
-      // --- show (ข้อมูลของตัวเอง) ---
+      // --- show (ข้อมูลของตัวเอง) — ไม่โชว์ชื่อผู้เล่น ---
       if (commandName === 'show') {
         const doc = await Verify.findOne({ discordId: interaction.user.id });
         if (!doc) return interaction.reply({ content: '❌ ยังไม่มีข้อมูลของคุณ', ephemeral: true });
-        const success = buildSuccessEmbed({
+        const userEmbed = buildUserConfirmEmbed({
           discordId: doc.discordId,
           discordName: doc.discordName,
-          playFabId: doc.playFabId,
-          playerName: doc.playerName
+          playFabId: doc.playFabId
         });
-        return interaction.reply({ embeds: [success], ephemeral: true });
+        return interaction.reply({ embeds: [userEmbed], ephemeral: true });
       }
 
-      // --- edit (ข้อมูลของตัวเอง) ---
+      // --- edit (ของผู้ใช้เอง) — ไม่ประกาศชื่อผู้เล่นกลับ ---
       if (commandName === 'edit') {
         const pid = interaction.options.getString('playerid', true).trim();
         const info = await getAccountInfoByPlayFabId(pid);
         if (!info.found) return interaction.reply({ embeds: [buildFailEmbed(pid)], ephemeral: true });
 
-        await Verify.findOneAndUpdate(
+        const updated = await Verify.findOneAndUpdate(
           { discordId: interaction.user.id },
           {
             discordId: interaction.user.id,
@@ -248,10 +261,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
           },
           { upsert: true, new: true }
         );
-        return interaction.reply({ content: `✅ อัปเดตเป็น ${info.displayName || info.username || '—'}`, ephemeral: true });
+
+        // ตอบแบบไม่ระบุชื่อผู้เล่น
+        return interaction.reply({ content: `✅ อัปเดตไอดีเกมเรียบร้อย`, ephemeral: true });
       }
 
-      // --- py-info (แอดมินทุกที่, ไม่ซ่อน) ---
+      // --- py-info (แอดมินทุกที่, ไม่ซ่อน) — แอดมินยังเห็นชื่อผู้เล่นได้ ---
       if (commandName === 'py-info') {
         const ok = await isAdminInPrimaryGuild(interaction.user.id);
         if (!ok) return interaction.reply({ content: '❌ คุณไม่มีบทบาทแอดมินในเซิร์ฟเวอร์หลัก', ephemeral: true });
@@ -272,7 +287,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return interaction.reply({ embeds: [embed] }); // ไม่ซ่อน
       }
 
-      // --- admin-show (แอดมินทุกที่, ไม่ซ่อน) ---
+      // --- admin-show (แอดมินทุกที่, ไม่ซ่อน) — แสดงชื่อได้ ---
       if (commandName === 'admin-show') {
         const ok = await isAdminInPrimaryGuild(interaction.user.id);
         if (!ok) return interaction.reply({ content: '❌ คุณไม่มีบทบาทแอดมินในเซิร์ฟเวอร์หลัก', ephemeral: true });
@@ -281,15 +296,20 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const doc = await Verify.findOne({ discordName: dname });
         if (!doc) return interaction.reply({ content: '❌ ไม่พบข้อมูลของผู้ใช้ชื่อนี้' });
 
-        return interaction.reply({ embeds: [buildSuccessEmbed({
-          discordId: doc.discordId,
-          discordName: doc.discordName,
-          playFabId: doc.playFabId,
-          playerName: doc.playerName
-        })] }); // ไม่ซ่อน
+        const adminEmbed = new EmbedBuilder()
+          .setTitle(`ข้อมูลของ ${dname}`)
+          .addFields(
+            { name: 'ไอดีเกม', value: doc.playFabId || '—', inline: true },
+            { name: 'ชื่อผู้เล่น', value: doc.playerName || '—', inline: true },
+            { name: 'Discord', value: `${doc.discordName} (${doc.discordId})`, inline: false }
+          )
+          .setColor(0x5865F2)
+          .setTimestamp();
+
+        return interaction.reply({ embeds: [adminEmbed] }); // ไม่ซ่อน
       }
 
-      // --- admin-edit (แอดมินทุกที่, ไม่ซ่อน) ---
+      // --- admin-edit (แอดมินทุกที่, ไม่ซ่อน) — แสดงชื่อได้ ---
       if (commandName === 'admin-edit') {
         const ok = await isAdminInPrimaryGuild(interaction.user.id);
         if (!ok) return interaction.reply({ content: '❌ คุณไม่มีบทบาทแอดมินในเซิร์ฟเวอร์หลัก', ephemeral: true });
@@ -306,15 +326,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
         );
         if (!updated) return interaction.reply({ content: '❌ ไม่พบผู้ใช้' });
 
-        return interaction.reply({
-          content: `✅ อัปเดต ${dname} เป็น ${updated.playerName || '—'}`,
-          embeds: [buildSuccessEmbed({
-            discordId: updated.discordId,
-            discordName: updated.discordName,
-            playFabId: updated.playFabId,
-            playerName: updated.playerName
-          })]
-        }); // ไม่ซ่อน
+        const adminEmbed = new EmbedBuilder()
+          .setTitle(`อัปเดตข้อมูลของ ${dname} สำเร็จ`)
+          .addFields(
+            { name: 'ไอดีเกม', value: updated.playFabId || '—', inline: true },
+            { name: 'ชื่อผู้เล่น', value: updated.playerName || '—', inline: true },
+            { name: 'Discord', value: `${updated.discordName} (${updated.discordId})`, inline: false }
+          )
+          .setColor(0x2ecc71)
+          .setTimestamp();
+
+        return interaction.reply({ embeds: [adminEmbed] }); // ไม่ซ่อน
       }
     }
 
@@ -330,7 +352,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
     }
 
-    // โมดอล submit → บันทึกลง Mongo + ส่ง Log + DM (embed)
+    // โมดอล submit → บันทึกลง Mongo + ส่ง Log + DM/Reply (ไม่โชว์ชื่อผู้เล่น)
     if (interaction.type === InteractionType.ModalSubmit && interaction.customId === 'verify_modal') {
       const pfId = interaction.fields.getTextInputValue('playfab_id').trim();
       await interaction.deferReply({ ephemeral: true });
@@ -353,21 +375,25 @@ client.on(Events.InteractionCreate, async (interaction) => {
         { upsert: true, new: true }
       );
 
-      const success = buildSuccessEmbed({
+      // 1) ส่ง log (รวมชื่อผู้เล่น)
+      const logEmbed = buildLogEmbed({
         discordId: doc.discordId,
         discordName: doc.discordName,
         playFabId: doc.playFabId,
         playerName: doc.playerName
       });
+      await logToPrimaryGuild(logEmbed);
 
-      // 1) DM ผู้ยืนยัน
-      try { await interaction.user.send({ embeds: [success] }); } catch {}
+      // 2) DM ผู้ยืนยัน (ไม่ระบุชื่อผู้เล่น)
+      const userEmbed = buildUserConfirmEmbed({
+        discordId: doc.discordId,
+        discordName: doc.discordName,
+        playFabId: doc.playFabId
+      });
+      try { await interaction.user.send({ embeds: [userEmbed] }); } catch {}
 
-      // 2) ส่ง log ไปห้อง 1404414214839341056 (หรือ LOG_CHANNEL_ID_A)
-      await logToPrimaryGuild(success);
-
-      // 3) ตอบกลับในที่เดิมแบบซ่อน (เพื่อความเป็นส่วนตัว)
-      return interaction.editReply({ content: 'บันทึกข้อมูลและยืนยันสำเร็จ ✅', embeds: [success] });
+      // 3) ตอบกลับในที่เดิมแบบซ่อน (ไม่ระบุชื่อผู้เล่น)
+      return interaction.editReply({ content: 'บันทึกข้อมูลและยืนยันสำเร็จ ✅', embeds: [userEmbed] });
     }
   } catch (e) {
     console.error('Interaction error:', e);
