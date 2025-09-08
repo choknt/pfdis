@@ -28,19 +28,19 @@ const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const MONGO_URI = process.env.MONGO_URI;
 const TITLE_ID = process.env.PLAYFAB_TITLE_ID;
 
-// ศูนย์กลางตรวจสิทธิ์ (Server A เดิม; ใช้กติกาเดิม)
+// ศูนย์กลางตรวจสิทธิ์ (Server A)
 const PRIMARY_GUILD_ID = process.env.PRIMARY_GUILD_ID;
 const ADMIN_ROLE_ID_A  = process.env.ADMIN_ROLE_ID_A;
 
 // ห้อง log (ถ้าไม่ตั้งจะใช้ค่าที่โจทย์ให้)
 const LOG_CHANNEL_ID_A = process.env.LOG_CHANNEL_ID_A || '1404414214839341056';
 
-// เซิร์ฟเวอร์/บทบาทสำหรับเงื่อนไขใหม่
-const GRANT_GUILD_ID      = '1127540917667119125';
-const ALWAYS_ROLE_IDS     = ['1127540917683888152','1414626804190150787']; // ให้เสมอหลังยืนยัน
-const CLAN_ROLE_ID        = '1139181683300634664'; // ให้ถ้าอยู่ในลิสต์แคลน
+// เซิร์ฟเวอร์/บทบาทสำหรับให้บทบาทหลังยืนยัน
+const GRANT_GUILD_ID  = '1127540917667119125';
+const ALWAYS_ROLE_IDS = ['1127540917683888152','1414626804190150787']; // ให้เสมอ
+const CLAN_ROLE_ID    = '1139181683300634664'; // ให้ถ้าอยู่ในลิสต์แคลน
 
-const FORM_IMAGE_URL = process.env.FORM_IMAGE_URL;          // optional
+const FORM_IMAGE_URL = process.env.FORM_IMAGE_URL; // optional
 const PORT = process.env.PORT || 3000;
 
 for (const [k, v] of Object.entries({
@@ -53,14 +53,14 @@ for (const [k, v] of Object.entries({
 const Verify = mongoose.model(
   'Verify',
   new mongoose.Schema({
-    discordId:   { type: String, index: true, unique: true },
+    discordId:   { type: String, index: true, unique: true }, // 1 Discord ⇄ 1 doc
     discordName: { type: String, index: true },
-    playFabId:   { type: String, index: true },
+    playFabId:   { type: String, index: true, unique: true }, // ป้องกันซ้ำระหว่างผู้ใช้
     playerName:  String
   }, { timestamps: true })
 );
 
-// ลิสต์ “แคลน”
+// ลิสต์ “แคลน” (PlayFabId ที่จะได้ Clan Role)
 const ClanAllow = mongoose.model(
   'ClanAllow',
   new mongoose.Schema({
@@ -136,7 +136,6 @@ async function grantRolesAfterVerify(userId) {
     const guild = await client.guilds.fetch(GRANT_GUILD_ID);
     let member;
     try { member = await guild.members.fetch(userId); } catch { return { ok:false, reason:'not_in_guild' }; }
-    // เพิ่มบทบาทที่ให้เสมอ
     for (const rid of ALWAYS_ROLE_IDS) {
       try { await member.roles.add(rid); } catch (e) { console.warn('add ALWAYS role error:', rid, e?.message); }
     }
@@ -227,7 +226,10 @@ function buildFailEmbed(playFabId) {
 
 /* ========= Slash Commands ========= */
 const commands = [
+  // แอดมินส่งฟอร์ม (แสดงปุ่ม + โมดอล)
   new SlashCommandBuilder().setName('send-form').setDescription('ส่งฟอร์มยืนยันผู้เล่น (แอดมินเท่านั้น)').setDMPermission(true),
+
+  // ผู้ใช้ดู/แก้ของตนเอง
   new SlashCommandBuilder().setName('show').setDescription('ดูข้อมูลของคุณ').setDMPermission(true),
   new SlashCommandBuilder()
     .setName('edit')
@@ -235,7 +237,7 @@ const commands = [
     .addStringOption(o => o.setName('playerid').setDescription('ไอดีใหม่ (PlayFabId)').setRequired(true))
     .setDMPermission(true),
 
-  // คำสั่งแคลน (แอดมินเท่านั้น)
+  // แอดมินแคลน
   new SlashCommandBuilder()
     .setName('add')
     .setDescription('เพิ่มไอดีเกมเข้าลิสต์แคลน (แอดมิน)')
@@ -251,7 +253,7 @@ const commands = [
     .setDescription('ดูรายชื่อไอดีในลิสต์แคลน (แอดมิน)')
     .setDMPermission(true),
 
-  // แอดมิน info เดิม
+  // แอดมิน info
   new SlashCommandBuilder()
     .setName('py-info')
     .setDescription('แสดงข้อมูลผู้เล่นจาก PlayFabId (ตรวจบทบาทใน Server A)')
@@ -303,7 +305,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           discordId: doc.discordId,
           discordName: doc.discordName,
           playFabId: doc.playFabId,
-          clanStatusText: '—' // ไม่คำนวณย้อนหลัง
+          clanStatusText: '—'
         });
         return interaction.reply({ embeds: [userEmbed], ephemeral: true });
       }
@@ -311,19 +313,34 @@ client.on(Events.InteractionCreate, async (interaction) => {
       // --- edit (ของตัวเอง) — ไม่ประกาศชื่อผู้เล่นกลับ ---
       if (commandName === 'edit') {
         const pid = interaction.options.getString('playerid', true).trim();
+
+        // ตรวจว่า PlayFabId ใหม่นี้ถูกผู้อื่นใช้อยู่หรือไม่
+        const taken = await Verify.findOne({ playFabId: pid });
+        if (taken && taken.discordId !== interaction.user.id) {
+          return interaction.reply({ content: `❌ PlayFabId นี้ถูกใช้งานโดยผู้ใช้อื่นแล้ว`, ephemeral: true });
+        }
+
         const info = await getAccountInfoByPlayFabId(pid);
         if (!info.found) return interaction.reply({ embeds: [buildFailEmbed(pid)], ephemeral: true });
 
-        await Verify.findOneAndUpdate(
-          { discordId: interaction.user.id },
-          {
-            discordId: interaction.user.id,
-            discordName: interaction.user.tag || interaction.user.username,
-            playFabId: pid,
-            playerName: info.displayName || info.username || null
-          },
-          { upsert: true, new: true }
-        );
+        try {
+          await Verify.findOneAndUpdate(
+            { discordId: interaction.user.id },
+            {
+              discordId: interaction.user.id,
+              discordName: interaction.user.tag || interaction.user.username,
+              playFabId: pid,
+              playerName: info.displayName || info.username || null
+            },
+            { upsert: true, new: true }
+          );
+        } catch (e) {
+          if (e?.code === 11000) {
+            return interaction.reply({ content: `❌ PlayFabId นี้ถูกใช้งานโดยผู้ใช้อื่นแล้ว`, ephemeral: true });
+          }
+          throw e;
+        }
+
         return interaction.reply({ content: `✅ อัปเดตไอดีเกมเรียบร้อย`, ephemeral: true });
       }
 
@@ -336,11 +353,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const info = await getAccountInfoByPlayFabId(pid);
         if (!info.found) return interaction.reply({ content:'❌ ไม่พบไอดีนี้ใน PlayFab', ephemeral:true });
 
-        await ClanAllow.findOneAndUpdate(
-          { playFabId: pid },
-          { playFabId: pid, playerName: info.displayName || info.username || null },
-          { upsert:true, new:true }
-        );
+        try {
+          await ClanAllow.findOneAndUpdate(
+            { playFabId: pid },
+            { playFabId: pid, playerName: info.displayName || info.username || null },
+            { upsert:true, new:true }
+          );
+        } catch (e) {
+          if (e?.code === 11000) {
+            // แปลว่ามีอยู่แล้ว
+          }
+        }
         return interaction.reply({ content:`✅ เพิ่ม ${pid} เข้าลิสต์แคลนแล้ว`, ephemeral:true });
       }
 
@@ -418,6 +441,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         const dname = interaction.options.getString('discord_name', true);
         const newPid = interaction.options.getString('playerid', true);
+
+        // หา target ก่อน เพื่อเช็คว่า newPid ซ้ำคนอื่นหรือไม่
+        const target = await Verify.findOne({ discordName: dname });
+        if (!target) return interaction.reply({ content: '❌ ไม่พบผู้ใช้', ephemeral: true });
+
+        const taken = await Verify.findOne({ playFabId: newPid });
+        if (taken && taken.discordId !== target.discordId) {
+          return interaction.reply({ content: `❌ PlayFabId นี้ถูกใช้งานโดยผู้ใช้อื่นแล้ว`, ephemeral: true });
+        }
+
         const info = await getAccountInfoByPlayFabId(newPid);
         if (!info.found) return interaction.reply({ embeds: [buildFailEmbed(newPid)] });
 
@@ -426,7 +459,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
           { playFabId: newPid, playerName: info.displayName || info.username || null },
           { new: true }
         );
-        if (!updated) return interaction.reply({ content: '❌ ไม่พบผู้ใช้' });
 
         const adminEmbed = new EmbedBuilder()
           .setTitle(`อัปเดตข้อมูลของ ${dname} สำเร็จ`)
@@ -466,19 +498,41 @@ client.on(Events.InteractionCreate, async (interaction) => {
         return interaction.editReply({ embeds: [fail] });
       }
 
-      const doc = await Verify.findOneAndUpdate(
-        { discordId: interaction.user.id },
-        {
-          discordId: interaction.user.id,
-          discordName: interaction.user.tag || interaction.user.username,
-          playFabId: pfId,
-          playerName: info.displayName || info.username || null
-        },
-        { upsert: true, new: true }
-      );
+      // ❗ ป้องกันซ้ำ: ถ้า PlayFabId นี้ถูกคนอื่นใช้แล้ว ห้ามยืนยัน
+      const claimed = await Verify.findOne({ playFabId: pfId });
+      if (claimed && claimed.discordId !== interaction.user.id) {
+        const msg = new EmbedBuilder()
+          .setTitle('ไม่สามารถยืนยันได้')
+          .setDescription(`PlayFabId **${pfId}** ถูกใช้งานโดยผู้ใช้อื่นแล้ว`)
+          .setColor(0xe74c3c);
+        return interaction.editReply({ embeds: [msg] });
+      }
+
+      let doc;
+      try {
+        doc = await Verify.findOneAndUpdate(
+          { discordId: interaction.user.id },
+          {
+            discordId: interaction.user.id,
+            discordName: interaction.user.tag || interaction.user.username,
+            playFabId: pfId,
+            playerName: info.displayName || info.username || null
+          },
+          { upsert: true, new: true }
+        );
+      } catch (e) {
+        if (e?.code === 11000) {
+          const msg = new EmbedBuilder()
+            .setTitle('ไม่สามารถยืนยันได้')
+            .setDescription(`PlayFabId นี้ถูกใช้งานโดยผู้ใช้อื่นแล้ว`)
+            .setColor(0xe74c3c);
+          return interaction.editReply({ embeds: [msg] });
+        }
+        throw e;
+      }
 
       // ให้บทบาทในกิลด์เป้าหมาย (สองบทบาทเสมอ)
-      const baseRoles = await grantRolesAfterVerify(interaction.user.id);
+      await grantRolesAfterVerify(interaction.user.id);
 
       // ถ้าอยู่ในลิสต์แคลน → ให้บทบาทแคลนเพิ่ม
       const clanGrant = await grantClanRoleIfAllowed(interaction.user.id, pfId);
@@ -503,7 +557,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
       });
 
       try { await interaction.user.send({ embeds: [userEmbed] }); } catch {}
-
       return interaction.editReply({ content: 'บันทึกข้อมูลและยืนยันสำเร็จ ✅', embeds: [userEmbed] });
     }
   } catch (e) {
@@ -512,7 +565,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       try { await interaction.reply({ content: 'เกิดข้อผิดพลาดภายในระบบ', ephemeral: true }); } catch {}
     }
   }
-}); // <== ปิด client.on(InteractionCreate)
+});
 
 /* ========= Health server ========= */
 const app = express();
