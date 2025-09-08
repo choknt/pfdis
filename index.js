@@ -27,10 +27,18 @@ const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.DISCORD_CLIENT_ID;
 const MONGO_URI = process.env.MONGO_URI;
 const TITLE_ID = process.env.PLAYFAB_TITLE_ID;
-const PRIMARY_GUILD_ID = process.env.PRIMARY_GUILD_ID;      // Server A
-const ADMIN_ROLE_ID_A  = process.env.ADMIN_ROLE_ID_A;       // Admin role in Server A
-// ใช้ห้อง log ตามโจทย์ 1404414214839341056 โดย default ถ้าไม่ใส่ ENV
+
+// ศูนย์กลางตรวจสิทธิ์ (Server A เดิม; ใช้กติกาเดิม)
+const PRIMARY_GUILD_ID = process.env.PRIMARY_GUILD_ID;
+const ADMIN_ROLE_ID_A  = process.env.ADMIN_ROLE_ID_A;
+
+// ห้อง log (ถ้าไม่ตั้งจะใช้ค่าที่โจทย์ให้)
 const LOG_CHANNEL_ID_A = process.env.LOG_CHANNEL_ID_A || '1404414214839341056';
+
+// เซิร์ฟเวอร์/บทบาทสำหรับเงื่อนไขใหม่
+const GRANT_GUILD_ID      = '1127540917667119125';
+const ALWAYS_ROLE_IDS     = ['1127540917683888152','1414626804190150787']; // ให้เสมอหลังยืนยัน
+const CLAN_ROLE_ID        = '1139181683300634664'; // ให้ถ้าอยู่ในลิสต์แคลน
 
 const FORM_IMAGE_URL = process.env.FORM_IMAGE_URL;          // optional
 const PORT = process.env.PORT || 3000;
@@ -41,13 +49,22 @@ for (const [k, v] of Object.entries({
   if (!v) { console.error('❌ Missing env:', k); process.exit(1); }
 }
 
-/* ========= Mongo Model ========= */
+/* ========= Mongo Models ========= */
 const Verify = mongoose.model(
   'Verify',
   new mongoose.Schema({
     discordId:   { type: String, index: true, unique: true },
     discordName: { type: String, index: true },
     playFabId:   { type: String, index: true },
+    playerName:  String
+  }, { timestamps: true })
+);
+
+// ลิสต์ “แคลน”
+const ClanAllow = mongoose.model(
+  'ClanAllow',
+  new mongoose.Schema({
+    playFabId:   { type: String, index: true, unique: true },
     playerName:  String
   }, { timestamps: true })
 );
@@ -94,7 +111,7 @@ const client = new Client({
   partials: [Partials.Channel]
 });
 
-/* ========= Helpers (Server A) ========= */
+/* ========= Helpers ========= */
 async function isAdminInPrimaryGuild(userId) {
   try {
     const guildA = await client.guilds.fetch(PRIMARY_GUILD_ID);
@@ -111,6 +128,36 @@ async function logToPrimaryGuild(embed) {
     if (ch?.type === ChannelType.GuildText) await ch.send({ embeds: [embed] });
   } catch (e) {
     console.warn('logToPrimaryGuild error:', e?.message);
+  }
+}
+
+async function grantRolesAfterVerify(userId) {
+  try {
+    const guild = await client.guilds.fetch(GRANT_GUILD_ID);
+    let member;
+    try { member = await guild.members.fetch(userId); } catch { return { ok:false, reason:'not_in_guild' }; }
+    // เพิ่มบทบาทที่ให้เสมอ
+    for (const rid of ALWAYS_ROLE_IDS) {
+      try { await member.roles.add(rid); } catch (e) { console.warn('add ALWAYS role error:', rid, e?.message); }
+    }
+    return { ok:true };
+  } catch (e) {
+    console.warn('grantRolesAfterVerify error:', e?.message);
+    return { ok:false, reason:'fetch_guild_failed' };
+  }
+}
+async function grantClanRoleIfAllowed(userId, playFabId) {
+  try {
+    const allowed = await ClanAllow.findOne({ playFabId });
+    if (!allowed) return { ok:false, reason:'not_in_allow' };
+    const guild = await client.guilds.fetch(GRANT_GUILD_ID);
+    let member;
+    try { member = await guild.members.fetch(userId); } catch { return { ok:false, reason:'not_in_guild' }; }
+    try { await member.roles.add(CLAN_ROLE_ID); return { ok:true, wasAllowed:true, playerName: allowed.playerName || null }; }
+    catch (e) { return { ok:false, reason:e?.message, wasAllowed:true, playerName: allowed.playerName || null }; }
+  } catch (e) {
+    console.warn('grantClanRoleIfAllowed error:', e?.message);
+    return { ok:false, reason:'error' };
   }
 }
 
@@ -142,27 +189,28 @@ function buildVerifyModal() {
   return modal;
 }
 
-/* ========== Embeds (แยก “ผู้ใช้” กับ “log”) ========== */
-// สำหรับตอบผู้ใช้ในเซิร์ฟเวอร์/DM — ไม่แสดงชื่อผู้เล่น
-function buildUserConfirmEmbed({ discordId, discordName, playFabId }) {
+// ผู้ใช้/DM/ห้อง (ไม่โชว์ชื่อผู้เล่น)
+function buildUserConfirmEmbed({ discordId, discordName, playFabId, clanStatusText }) {
   return new EmbedBuilder()
     .setTitle('ยืนยันผ่าน:')
     .setDescription('ตอนนี้คุณผ่านการยืนยัน')
     .addFields(
       { name: 'ไอดีเกม', value: playFabId, inline: false },
+      { name: 'สถานะแคลน', value: clanStatusText || '—', inline: true },
       { name: 'ไอดี Discord', value: discordId, inline: true },
       { name: 'ชื่อ Discord', value: discordName || '—', inline: true }
     )
     .setColor(0x2ecc71)
     .setTimestamp();
 }
-// สำหรับ log แอดมิน — แสดงชื่อผู้เล่นด้วย
-function buildLogEmbed({ discordId, discordName, playFabId, playerName }) {
+// สำหรับ log (แอดมินเห็นชื่อผู้เล่นได้)
+function buildLogEmbed({ discordId, discordName, playFabId, playerName, clan }) {
   return new EmbedBuilder()
     .setTitle('LOG: ยืนยันผู้เล่นสำเร็จ')
     .addFields(
       { name: 'ไอดีเกม', value: playFabId, inline: true },
       { name: 'ชื่อผู้เล่น', value: playerName || '—', inline: true },
+      { name: 'แคลน', value: clan ? 'ใช่' : 'ไม่ใช่', inline: true },
       { name: 'Discord', value: `${discordName || '—'} (${discordId})`, inline: false }
     )
     .setColor(0x3498db)
@@ -171,14 +219,13 @@ function buildLogEmbed({ discordId, discordName, playFabId, playerName }) {
 function buildFailEmbed(playFabId) {
   return new EmbedBuilder()
     .setTitle('ไม่ผ่านการยืนยัน:')
-    .setDescription(`เราขอแสดงความเสียใจ เราไม่พบ **${playFabId}** ในระบบที่คุณส่งมา โปรดลองอีกครั้ง และโปรดตรวจสอบไอดีเกมให้ถูกต้อง`)
+    .setDescription(`เราไม่พบ **${playFabId}** ในระบบที่คุณส่งมา โปรดลองอีกครั้ง และโปรดตรวจสอบไอดีเกมให้ถูกต้อง`)
     .setImage(FORM_IMAGE_URL || DEFAULT_FORM_IMAGE)
     .setColor(0xe74c3c)
     .setTimestamp();
 }
 
 /* ========= Slash Commands ========= */
-// /send-form = แอดมินเท่านั้น (ตรวจสิทธิ์ใน handler) และ “ไม่ซ่อน” เพื่อให้ฟอร์มอยู่ใช้ได้ตลอด
 const commands = [
   new SlashCommandBuilder().setName('send-form').setDescription('ส่งฟอร์มยืนยันผู้เล่น (แอดมินเท่านั้น)').setDMPermission(true),
   new SlashCommandBuilder().setName('show').setDescription('ดูข้อมูลของคุณ').setDMPermission(true),
@@ -188,7 +235,23 @@ const commands = [
     .addStringOption(o => o.setName('playerid').setDescription('ไอดีใหม่ (PlayFabId)').setRequired(true))
     .setDMPermission(true),
 
-  // แอดมิน (ทุกที่ แต่ตรวจบทบาทใน Server A) — ไม่ซ่อนผลลัพธ์
+  // คำสั่งแคลน (แอดมินเท่านั้น)
+  new SlashCommandBuilder()
+    .setName('add')
+    .setDescription('เพิ่มไอดีเกมเข้าลิสต์แคลน (แอดมิน)')
+    .addStringOption(o => o.setName('playerid').setDescription('PlayFabId').setRequired(true))
+    .setDMPermission(true),
+  new SlashCommandBuilder()
+    .setName('delete')
+    .setDescription('ลบไอดีเกมออกจากลิสต์แคลน (แอดมิน)')
+    .addStringOption(o => o.setName('playerid').setDescription('PlayFabId').setRequired(true))
+    .setDMPermission(true),
+  new SlashCommandBuilder()
+    .setName('list')
+    .setDescription('ดูรายชื่อไอดีในลิสต์แคลน (แอดมิน)')
+    .setDMPermission(true),
+
+  // แอดมิน info เดิม
   new SlashCommandBuilder()
     .setName('py-info')
     .setDescription('แสดงข้อมูลผู้เล่นจาก PlayFabId (ตรวจบทบาทใน Server A)')
@@ -229,29 +292,29 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (commandName === 'send-form') {
         const ok = await isAdminInPrimaryGuild(interaction.user.id);
         if (!ok) return interaction.reply({ content: '❌ คำสั่งนี้สำหรับแอดมินในเซิร์ฟเวอร์หลักเท่านั้น', ephemeral: true });
-        // ไม่ซ่อน เพื่อให้ฟอร์มอยู่ใช้ได้ตลอด
         return interaction.reply({ embeds: [buildFormEmbed()], components: [buildVerifyButtonRow()] });
       }
 
-      // --- show (ข้อมูลของตัวเอง) — ไม่โชว์ชื่อผู้เล่น ---
+      // --- show (ของตัวเอง) — ไม่โชว์ชื่อผู้เล่น ---
       if (commandName === 'show') {
         const doc = await Verify.findOne({ discordId: interaction.user.id });
         if (!doc) return interaction.reply({ content: '❌ ยังไม่มีข้อมูลของคุณ', ephemeral: true });
         const userEmbed = buildUserConfirmEmbed({
           discordId: doc.discordId,
           discordName: doc.discordName,
-          playFabId: doc.playFabId
+          playFabId: doc.playFabId,
+          clanStatusText: '—' // ไม่คำนวณย้อนหลัง
         });
         return interaction.reply({ embeds: [userEmbed], ephemeral: true });
       }
 
-      // --- edit (ของผู้ใช้เอง) — ไม่ประกาศชื่อผู้เล่นกลับ ---
+      // --- edit (ของตัวเอง) — ไม่ประกาศชื่อผู้เล่นกลับ ---
       if (commandName === 'edit') {
         const pid = interaction.options.getString('playerid', true).trim();
         const info = await getAccountInfoByPlayFabId(pid);
         if (!info.found) return interaction.reply({ embeds: [buildFailEmbed(pid)], ephemeral: true });
 
-        const updated = await Verify.findOneAndUpdate(
+        await Verify.findOneAndUpdate(
           { discordId: interaction.user.id },
           {
             discordId: interaction.user.id,
@@ -261,12 +324,51 @@ client.on(Events.InteractionCreate, async (interaction) => {
           },
           { upsert: true, new: true }
         );
-
-        // ตอบแบบไม่ระบุชื่อผู้เล่น
         return interaction.reply({ content: `✅ อัปเดตไอดีเกมเรียบร้อย`, ephemeral: true });
       }
 
-      // --- py-info (แอดมินทุกที่, ไม่ซ่อน) — แอดมินยังเห็นชื่อผู้เล่นได้ ---
+      // --- clan admin: /add ---
+      if (commandName === 'add') {
+        const ok = await isAdminInPrimaryGuild(interaction.user.id);
+        if (!ok) return interaction.reply({ content:'❌ คุณไม่มีบทบาทแอดมินในเซิร์ฟเวอร์หลัก', ephemeral:true });
+
+        const pid = interaction.options.getString('playerid', true).trim();
+        const info = await getAccountInfoByPlayFabId(pid);
+        if (!info.found) return interaction.reply({ content:'❌ ไม่พบไอดีนี้ใน PlayFab', ephemeral:true });
+
+        await ClanAllow.findOneAndUpdate(
+          { playFabId: pid },
+          { playFabId: pid, playerName: info.displayName || info.username || null },
+          { upsert:true, new:true }
+        );
+        return interaction.reply({ content:`✅ เพิ่ม ${pid} เข้าลิสต์แคลนแล้ว`, ephemeral:true });
+      }
+
+      // --- clan admin: /delete ---
+      if (commandName === 'delete') {
+        const ok = await isAdminInPrimaryGuild(interaction.user.id);
+        if (!ok) return interaction.reply({ content:'❌ คุณไม่มีบทบาทแอดมินในเซิร์ฟเวอร์หลัก', ephemeral:true });
+
+        const pid = interaction.options.getString('playerid', true).trim();
+        const del = await ClanAllow.findOneAndDelete({ playFabId: pid });
+        if (!del) return interaction.reply({ content:'ℹ️ ไม่พบไอดีนี้ในลิสต์', ephemeral:true });
+        return interaction.reply({ content:`✅ ลบ ${pid} ออกจากลิสต์แล้ว`, ephemeral:true });
+      }
+
+      // --- clan admin: /list ---
+      if (commandName === 'list') {
+        const ok = await isAdminInPrimaryGuild(interaction.user.id);
+        if (!ok) return interaction.reply({ content:'❌ คุณไม่มีบทบาทแอดมินในเซิร์ฟเวอร์หลัก', ephemeral:true });
+
+        const rows = await ClanAllow.find({}).sort({ createdAt: 1 }).lean();
+        if (!rows.length) return interaction.reply({ content:'(ว่าง) ไม่มีรายการ', ephemeral:true });
+
+        const body = rows.map(r => `${r.playFabId} ${r.playerName || '-'}`).join('\n');
+        const e = new EmbedBuilder().setTitle('ลิสต์แคลน').setDescription(body).setColor(0x95a5a6);
+        return interaction.reply({ embeds:[e], ephemeral:true });
+      }
+
+      // --- py-info (แอดมินทุกที่, ไม่ซ่อน) ---
       if (commandName === 'py-info') {
         const ok = await isAdminInPrimaryGuild(interaction.user.id);
         if (!ok) return interaction.reply({ content: '❌ คุณไม่มีบทบาทแอดมินในเซิร์ฟเวอร์หลัก', ephemeral: true });
@@ -284,10 +386,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .setColor(0x00a8ff)
           .setTimestamp();
 
-        return interaction.reply({ embeds: [embed] }); // ไม่ซ่อน
+        return interaction.reply({ embeds: [embed] });
       }
 
-      // --- admin-show (แอดมินทุกที่, ไม่ซ่อน) — แสดงชื่อได้ ---
+      // --- admin-show (แอดมินทุกที่, ไม่ซ่อน) ---
       if (commandName === 'admin-show') {
         const ok = await isAdminInPrimaryGuild(interaction.user.id);
         if (!ok) return interaction.reply({ content: '❌ คุณไม่มีบทบาทแอดมินในเซิร์ฟเวอร์หลัก', ephemeral: true });
@@ -306,10 +408,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .setColor(0x5865F2)
           .setTimestamp();
 
-        return interaction.reply({ embeds: [adminEmbed] }); // ไม่ซ่อน
+        return interaction.reply({ embeds: [adminEmbed] });
       }
 
-      // --- admin-edit (แอดมินทุกที่, ไม่ซ่อน) — แสดงชื่อได้ ---
+      // --- admin-edit (แอดมินทุกที่, ไม่ซ่อน) ---
       if (commandName === 'admin-edit') {
         const ok = await isAdminInPrimaryGuild(interaction.user.id);
         if (!ok) return interaction.reply({ content: '❌ คุณไม่มีบทบาทแอดมินในเซิร์ฟเวอร์หลัก', ephemeral: true });
@@ -336,11 +438,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .setColor(0x2ecc71)
           .setTimestamp();
 
-        return interaction.reply({ embeds: [adminEmbed] }); // ไม่ซ่อน
+        return interaction.reply({ embeds: [adminEmbed] });
       }
     }
 
-    // ปุ่ม → เปิดโมดอล (หุ้ม try/catch กัน error “ไม่สามารถเปิดฟอร์มได้”)
+    // ปุ่ม → เปิดโมดอล
     if (interaction.isButton() && interaction.customId === 'open_verify_modal') {
       try {
         return await interaction.showModal(buildVerifyModal());
@@ -352,7 +454,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
     }
 
-    // โมดอล submit → บันทึกลง Mongo + ส่ง Log + DM/Reply (ไม่โชว์ชื่อผู้เล่น)
+    // โมดอล submit → บันทึก Mongo + ให้บทบาท + Log + DM/Reply (ไม่โชว์ชื่อผู้เล่น)
     if (interaction.type === InteractionType.ModalSubmit && interaction.customId === 'verify_modal') {
       const pfId = interaction.fields.getTextInputValue('playfab_id').trim();
       await interaction.deferReply({ ephemeral: true });
@@ -375,24 +477,33 @@ client.on(Events.InteractionCreate, async (interaction) => {
         { upsert: true, new: true }
       );
 
-      // 1) ส่ง log (รวมชื่อผู้เล่น)
+      // ให้บทบาทในกิลด์เป้าหมาย (สองบทบาทเสมอ)
+      const baseRoles = await grantRolesAfterVerify(interaction.user.id);
+
+      // ถ้าอยู่ในลิสต์แคลน → ให้บทบาทแคลนเพิ่ม
+      const clanGrant = await grantClanRoleIfAllowed(interaction.user.id, pfId);
+      const isClan = !!(clanGrant.wasAllowed);
+
+      // Log (ระบุชื่อผู้เล่นได้)
       const logEmbed = buildLogEmbed({
         discordId: doc.discordId,
         discordName: doc.discordName,
         playFabId: doc.playFabId,
-        playerName: doc.playerName
+        playerName: doc.playerName,
+        clan: isClan
       });
       await logToPrimaryGuild(logEmbed);
 
-      // 2) DM ผู้ยืนยัน (ไม่ระบุชื่อผู้เล่น)
+      // DM/Reply (ไม่ระบุชื่อผู้เล่น แต่บอกสถานะแคลน)
       const userEmbed = buildUserConfirmEmbed({
         discordId: doc.discordId,
         discordName: doc.discordName,
-        playFabId: doc.playFabId
+        playFabId: doc.playFabId,
+clanStatusText: isClan ? 'ยืนยันว่าเป็นคนในแคลน ✅' : 'ไม่พบในลิสต์แคลน'
       });
+
       try { await interaction.user.send({ embeds: [userEmbed] }); } catch {}
 
-      // 3) ตอบกลับในที่เดิมแบบซ่อน (ไม่ระบุชื่อผู้เล่น)
       return interaction.editReply({ content: 'บันทึกข้อมูลและยืนยันสำเร็จ ✅', embeds: [userEmbed] });
     }
   } catch (e) {
@@ -423,3 +534,4 @@ app.listen(PORT, () => console.log('HTTP health server on', PORT));
     process.exit(1);
   }
 })();
+```0
