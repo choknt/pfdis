@@ -165,7 +165,7 @@ const DEFAULT_FORM_IMAGE = 'https://i.imgur.com/7W0r3aY.png'; // สำรอง
 function buildFormEmbed() {
   const e = new EmbedBuilder()
     .setTitle('โปรดยืนยันว่าคุณเป็นผู้เล่น โดยการป้อน ID ผู้เล่นของคุณ')
-    .setDescription('กดปุ่ม **ไอดีของคุณ** เพื่อกรอก **PlayFabId**\\nตัวอย่าง: `25CDF5286DC38DAD`')
+    .setDescription('กดปุ่ม **ไอดีของคุณ** เพื่อกรอก **Player id** ตัวอย่าง: `25CDF5286DC38DAD`')
     .setColor(0x5865f2);
   e.setImage(FORM_IMAGE_URL || DEFAULT_FORM_IMAGE);
   return e;
