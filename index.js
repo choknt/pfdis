@@ -40,6 +40,9 @@ const GRANT_GUILD_ID  = '1127540917667119125';
 const ALWAYS_ROLE_IDS = ['1127540917683888152','1414626804190150787']; // ให้เสมอ
 const CLAN_ROLE_ID    = '1139181683300634664'; // ให้ถ้าอยู่ในลิสต์แคลน
 
+// ตัวเลือก: ลงทะเบียนคำสั่งแบบ guild (dev เร็ว) หรือ global (ปล่อยจริง)
+const COMMAND_SCOPE = (process.env.COMMAND_SCOPE || 'global').toLowerCase(); // 'guild' | 'global'
+
 const FORM_IMAGE_URL = process.env.FORM_IMAGE_URL; // optional
 const PORT = process.env.PORT || 3000;
 
@@ -69,36 +72,69 @@ const ClanAllow = mongoose.model(
   }, { timestamps: true })
 );
 
-/* ========= PlayFab (Client API) ========= */
+/* ========= PlayFab (Client API) — login & auto-retry ========= */
 PlayFab.settings.titleId = TITLE_ID;
 let playfabReady = false;
-function ensurePlayFabLogin() {
-  if (playfabReady) return Promise.resolve(true);
+let lastLoginAt = 0;
+
+// ล็อกอินแบบ CustomID (ไม่ใช้ secret) + อายุเซสชัน ~50 นาที (ปรับได้)
+function loginPlayFab(force = false) {
   return new Promise((resolve) => {
+    if (!force && playfabReady && Date.now() - lastLoginAt < 1000 * 60 * 50) {
+      return resolve(true);
+    }
     const CustomId = 'bot-' + Math.random().toString(36).slice(2);
     PlayFab.PlayFabClient.LoginWithCustomID(
       { TitleId: TITLE_ID, CustomId, CreateAccount: true },
       (err) => {
-        if (err) { console.error('❌ PlayFab login failed:', err); return resolve(false); }
-        playfabReady = true; resolve(true);
+        if (err) {
+          console.error('❌ PlayFab login failed:', err);
+          playfabReady = false;
+          return resolve(false);
+        }
+        playfabReady = true;
+        lastLoginAt = Date.now();
+        console.log('✅ PlayFab logged in');
+        resolve(true);
       }
     );
   });
 }
-async function getAccountInfoByPlayFabId(playFabId) {
-  const ok = await ensurePlayFabLogin();
-  if (!ok) return { found: false, error: 'PlayFab session not ready' };
+
+// wrapper เรียก API + auto re-login เมื่อเจอปัญหา session/auth
+async function callPlayFab(methodName, params, { retries = 1 } = {}) {
+  const ok = await loginPlayFab(false);
+  if (!ok) return { ok:false, error: 'PlayFab session not ready' };
+
   return new Promise((resolve) => {
-    PlayFab.PlayFabClient.GetAccountInfo({ PlayFabId: playFabId }, (err, res) => {
-      if (err) return resolve({ found: false, error: err?.errorMessage || 'GetAccountInfo failed' });
-      const a = res?.data?.AccountInfo || {};
-      resolve({
-        found: true,
-        displayName: a?.TitleInfo?.DisplayName || null,
-        username: a?.Username || null
-      });
+    const api = PlayFab.PlayFabClient[methodName];
+    if (typeof api !== 'function') return resolve({ ok:false, error:`Unknown method ${methodName}` });
+
+    api(params, async (err, res) => {
+      if (err) {
+        const msg = err?.errorMessage || err?.error || JSON.stringify(err);
+        if (retries > 0 && /NotAuthenticated|InvalidSession|Session|Auth/i.test(msg)) {
+          console.warn('⚠️ PlayFab session error, re-logging in…', msg);
+          await loginPlayFab(true);
+          const again = await callPlayFab(methodName, params, { retries: retries - 1 });
+          return resolve(again);
+        }
+        return resolve({ ok:false, error: msg });
+      }
+      resolve({ ok:true, data: res?.data });
     });
   });
+}
+
+async function getAccountInfoByPlayFabId(playFabId) {
+  const r = await callPlayFab('GetAccountInfo', { PlayFabId: playFabId });
+  if (!r.ok) return { found:false, error: r.error };
+  const a = r.data?.AccountInfo || {};
+  return {
+    found: true,
+    displayName: a?.TitleInfo?.DisplayName || null,
+    username: a?.Username || null
+  };
 }
 
 /* ========= Discord Client ========= */
@@ -112,6 +148,8 @@ const client = new Client({
 });
 
 /* ========= Helpers ========= */
+const PLAYFAB_ID_RE = /^[A-F0-9]{16,32}$/i;
+
 async function isAdminInPrimaryGuild(userId) {
   try {
     const guildA = await client.guilds.fetch(PRIMARY_GUILD_ID);
@@ -137,7 +175,9 @@ async function grantRolesAfterVerify(userId) {
     let member;
     try { member = await guild.members.fetch(userId); } catch { return { ok:false, reason:'not_in_guild' }; }
     for (const rid of ALWAYS_ROLE_IDS) {
-      try { await member.roles.add(rid); } catch (e) { console.warn('add ALWAYS role error:', rid, e?.message); }
+      try { await member.roles.add(rid); } catch (e) { 
+        console.warn('add ALWAYS role error:', rid, e?.message); 
+      }
     }
     return { ok:true };
   } catch (e) {
@@ -215,13 +255,19 @@ function buildLogEmbed({ discordId, discordName, playFabId, playerName, clan }) 
     .setColor(0x3498db)
     .setTimestamp();
 }
-function buildFailEmbed(playFabId) {
-  return new EmbedBuilder()
-    .setTitle('ไม่ผ่านการยืนยัน:')
-    .setDescription(`เราไม่พบ **${playFabId}** ในระบบที่คุณส่งมา โปรดลองอีกครั้ง และโปรดตรวจสอบไอดีเกมให้ถูกต้อง`)
+function buildFailEmbed(playFabId, opts = {}) {
+  const { authIssue = false } = opts;
+  const e = new EmbedBuilder()
+    .setTitle(authIssue ? 'ระบบติดขัดชั่วคราว' : 'ไม่ผ่านการยืนยัน:')
+    .setDescription(
+      authIssue
+        ? '⚠️ ระบบยืนยันติดขัด (เซสชัน) โปรดลองใหม่อีกครั้งในอีกสักครู่'
+        : `เราไม่พบ **${playFabId}** ในระบบที่คุณส่งมา โปรดลองอีกครั้ง และโปรดตรวจสอบไอดีเกมให้ถูกต้อง`
+    )
     .setImage(FORM_IMAGE_URL || DEFAULT_FORM_IMAGE)
-    .setColor(0xe74c3c)
+    .setColor(authIssue ? 0xf1c40f : 0xe74c3c)
     .setTimestamp();
+  return e;
 }
 
 /* ========= Slash Commands ========= */
@@ -274,8 +320,13 @@ const commands = [
 
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(TOKEN);
-  await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
-  console.log('✅ Global commands registered');
+  if (COMMAND_SCOPE === 'guild') {
+    await rest.put(Routes.applicationGuildCommands(CLIENT_ID, PRIMARY_GUILD_ID), { body: commands });
+    console.log('✅ Guild commands registered (fast propagation)');
+  } else {
+    await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands });
+    console.log('✅ Global commands registered');
+  }
 }
 
 /* ========= Events ========= */
@@ -283,7 +334,6 @@ client.once(Events.ClientReady, async () => {
   console.log(`🤖 Logged in as ${client.user.tag}`);
   await registerCommands();
 });
-
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
     // Slash commands
@@ -312,7 +362,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       // --- edit (ของตัวเอง) — ไม่ประกาศชื่อผู้เล่นกลับ ---
       if (commandName === 'edit') {
-        const pid = interaction.options.getString('playerid', true).trim();
+        const pidRaw = interaction.options.getString('playerid', true).trim();
+        const pid = pidRaw.toUpperCase();
+        if (!PLAYFAB_ID_RE.test(pid)) {
+          return interaction.reply({ content: '❌ รูปแบบ PlayFabId ไม่ถูกต้อง (ควรเป็นตัวอักษร/ตัวเลข 16–32 ตัว)', ephemeral: true });
+        }
 
         // ตรวจว่า PlayFabId ใหม่นี้ถูกผู้อื่นใช้อยู่หรือไม่
         const taken = await Verify.findOne({ playFabId: pid });
@@ -321,7 +375,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
 
         const info = await getAccountInfoByPlayFabId(pid);
-        if (!info.found) return interaction.reply({ embeds: [buildFailEmbed(pid)], ephemeral: true });
+        if (!info.found) {
+          const authIssue = /session|auth/i.test(info.error || '');
+          return interaction.reply({ embeds: [buildFailEmbed(pid, { authIssue })], ephemeral: true });
+        }
 
         try {
           await Verify.findOneAndUpdate(
@@ -349,9 +406,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const ok = await isAdminInPrimaryGuild(interaction.user.id);
         if (!ok) return interaction.reply({ content:'❌ คุณไม่มีบทบาทแอดมินในเซิร์ฟเวอร์หลัก', ephemeral:true });
 
-        const pid = interaction.options.getString('playerid', true).trim();
+        const pidRaw = interaction.options.getString('playerid', true).trim();
+        const pid = pidRaw.toUpperCase();
+        if (!PLAYFAB_ID_RE.test(pid)) {
+          return interaction.reply({ content: '❌ รูปแบบ PlayFabId ไม่ถูกต้อง', ephemeral: true });
+        }
+
         const info = await getAccountInfoByPlayFabId(pid);
-        if (!info.found) return interaction.reply({ content:'❌ ไม่พบไอดีนี้ใน PlayFab', ephemeral:true });
+        if (!info.found) {
+          const authIssue = /session|auth/i.test(info.error || '');
+          return interaction.reply({ embeds: [buildFailEmbed(pid, { authIssue })], ephemeral: true });
+        }
 
         try {
           await ClanAllow.findOneAndUpdate(
@@ -372,7 +437,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const ok = await isAdminInPrimaryGuild(interaction.user.id);
         if (!ok) return interaction.reply({ content:'❌ คุณไม่มีบทบาทแอดมินในเซิร์ฟเวอร์หลัก', ephemeral:true });
 
-        const pid = interaction.options.getString('playerid', true).trim();
+        const pidRaw = interaction.options.getString('playerid', true).trim();
+        const pid = pidRaw.toUpperCase();
+        if (!PLAYFAB_ID_RE.test(pid)) {
+          return interaction.reply({ content: '❌ รูปแบบ PlayFabId ไม่ถูกต้อง', ephemeral: true });
+        }
+
         const del = await ClanAllow.findOneAndDelete({ playFabId: pid });
         if (!del) return interaction.reply({ content:'ℹ️ ไม่พบไอดีนี้ในลิสต์', ephemeral:true });
         return interaction.reply({ content:`✅ ลบ ${pid} ออกจากลิสต์แล้ว`, ephemeral:true });
@@ -396,9 +466,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const ok = await isAdminInPrimaryGuild(interaction.user.id);
         if (!ok) return interaction.reply({ content: '❌ คุณไม่มีบทบาทแอดมินในเซิร์ฟเวอร์หลัก', ephemeral: true });
 
-        const pid = interaction.options.getString('playerid', true);
+        const pidRaw = interaction.options.getString('playerid', true);
+        const pid = pidRaw.toUpperCase();
+        if (!PLAYFAB_ID_RE.test(pid)) {
+          return interaction.reply({ content: '❌ รูปแบบ PlayFabId ไม่ถูกต้อง', ephemeral: true });
+        }
+
         const info = await getAccountInfoByPlayFabId(pid);
-        if (!info.found) return interaction.reply({ content: '❌ ไม่พบผู้เล่น' });
+        if (!info.found) {
+          const authIssue = /session|auth/i.test(info.error || '');
+          return interaction.reply({ embeds: [buildFailEmbed(pid, { authIssue })] });
+        }
 
         const embed = new EmbedBuilder()
           .setTitle('ข้อมูลผู้เล่น (Server A)')
@@ -440,7 +518,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
         if (!ok) return interaction.reply({ content: '❌ คุณไม่มีบทบาทแอดมินในเซิร์ฟเวอร์หลัก', ephemeral: true });
 
         const dname = interaction.options.getString('discord_name', true);
-        const newPid = interaction.options.getString('playerid', true);
+        const newPidRaw = interaction.options.getString('playerid', true);
+        const newPid = newPidRaw.toUpperCase();
+        if (!PLAYFAB_ID_RE.test(newPid)) {
+          return interaction.reply({ content: '❌ รูปแบบ PlayFabId ไม่ถูกต้อง', ephemeral: true });
+        }
 
         // หา target ก่อน เพื่อเช็คว่า newPid ซ้ำคนอื่นหรือไม่
         const target = await Verify.findOne({ discordName: dname });
@@ -452,7 +534,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
 
         const info = await getAccountInfoByPlayFabId(newPid);
-        if (!info.found) return interaction.reply({ embeds: [buildFailEmbed(newPid)] });
+        if (!info.found) {
+          const authIssue = /session|auth/i.test(info.error || '');
+          return interaction.reply({ embeds: [buildFailEmbed(newPid, { authIssue })] });
+        }
 
         const updated = await Verify.findOneAndUpdate(
           { discordName: dname },
@@ -488,12 +573,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     // โมดอล submit → บันทึก Mongo + ให้บทบาท + Log + DM/Reply (ไม่โชว์ชื่อผู้เล่น)
     if (interaction.type === InteractionType.ModalSubmit && interaction.customId === 'verify_modal') {
-      const pfId = interaction.fields.getTextInputValue('playfab_id').trim();
+      const pfIdRaw = interaction.fields.getTextInputValue('playfab_id').trim();
+      const pfId = pfIdRaw.toUpperCase();
       await interaction.deferReply({ ephemeral: true });
+
+      if (!PLAYFAB_ID_RE.test(pfId)) {
+        return interaction.editReply({ content: '❌ รูปแบบ PlayFabId ไม่ถูกต้อง (ควรเป็นตัวอักษร/ตัวเลข 16–32 ตัว)' });
+      }
 
       const info = await getAccountInfoByPlayFabId(pfId);
       if (!info.found) {
-        const fail = buildFailEmbed(pfId);
+        const authIssue = /session|auth/i.test(info.error || '');
+        const fail = buildFailEmbed(pfId, { authIssue });
         try { await interaction.user.send({ embeds: [fail] }); } catch {}
         return interaction.editReply({ embeds: [fail] });
       }
@@ -532,7 +623,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       // ให้บทบาทในกิลด์เป้าหมาย (สองบทบาทเสมอ)
-      await grantRolesAfterVerify(interaction.user.id);
+      const baseGrant = await grantRolesAfterVerify(interaction.user.id);
 
       // ถ้าอยู่ในลิสต์แคลน → ให้บทบาทแคลนเพิ่ม
       const clanGrant = await grantClanRoleIfAllowed(interaction.user.id, pfId);
@@ -548,7 +639,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       });
       await logToPrimaryGuild(logEmbed);
 
-      // DM/Reply (ไม่ระบุชื่อผู้เล่น แต่บอกสถานะแคลน)
+      // DM/Reply (ไม่ระบุชื่อผู้เล่น แต่บอกสถานะแคลน + แจ้งเตือนถ้าเพิ่ม role ไม่ได้)
       const userEmbed = buildUserConfirmEmbed({
         discordId: doc.discordId,
         discordName: doc.discordName,
@@ -556,8 +647,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
         clanStatusText: isClan ? 'ยืนยันว่าเป็นคนในแคลน ✅' : 'ไม่พบในลิสต์แคลน'
       });
 
+      const extra =
+        baseGrant.ok ? '' :
+        '\n\n⚠️ ยืนยันแล้ว แต่ไม่สามารถเพิ่มบทบาทในกิลด์เป้าหมายได้ (อาจยังไม่ได้เข้ากิลด์ / สิทธิ์ไม่พอ) โปรดติดต่อแอดมิน';
+
       try { await interaction.user.send({ embeds: [userEmbed] }); } catch {}
-      return interaction.editReply({ content: 'บันทึกข้อมูลและยืนยันสำเร็จ ✅', embeds: [userEmbed] });
+      return interaction.editReply({ content: 'บันทึกข้อมูลและยืนยันสำเร็จ ✅' + extra, embeds: [userEmbed] });
     }
   } catch (e) {
     console.error('Interaction error:', e);
@@ -578,9 +673,16 @@ app.listen(PORT, () => console.log('HTTP health server on', PORT));
   try {
     await mongoose.connect(MONGO_URI);
     console.log('✅ Mongo connected');
-    const ok = await ensurePlayFabLogin();
-    if (!ok) throw new Error('PlayFab login failed');
+
+    const ok = await loginPlayFab(true); // force login ตอนบูต
+    if (!ok) throw new Error('PlayFab login failed at startup');
     console.log('✅ PlayFab session ready');
+
+    // ต่ออายุเซสชันเชิงรุกทุก 60 นาที
+    setInterval(() => {
+      loginPlayFab(true).then(ok => ok && console.log('🔁 PlayFab refreshed'));
+    }, 1000 * 60 * 60);
+
     await client.login(TOKEN);
   } catch (e) {
     console.error('Startup error:', e);
